@@ -21,6 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -31,32 +35,58 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          accept-android-sdk-licenses: true
+      # Do NOT use android-actions/setup-android.
+      # That action invokes sdkmanager tools and fails on current SDK repositories.
 
-      - name: Install Android SDK packages
+      - name: Locate Android SDK
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "Checking Android SDK..."
           echo "ANDROID_HOME=$ANDROID_HOME"
 
-          command -v sdkmanager
+          if [[ ! -d "$ANDROID_HOME" ]]; then
+            echo "::error::Android SDK directory not found."
+            exit 1
+          fi
 
-          echo "Installing Android SDK components..."
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1)"
 
-          sdkmanager --install \
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "::error::sdkmanager not found."
+            exit 1
+          fi
+
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
+          echo "SDK Manager: $SDKMANAGER"
+          echo "SDK directory:"
+          ls -la "$ANDROID_HOME"
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses
+          set -o pipefail
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          "$SDKMANAGER" --install \
             "platform-tools" \
-            "platforms;android-36" \
+            "platforms;android-36-ext1" \
             "build-tools;36.0.0"
 
-          echo "Installed SDK packages:"
-          sdkmanager --list_installed
+          echo "Installed Android SDK packages:"
+          "$SDKMANAGER" --list_installed
 
-      - name: Locate Android project
+      - name: Locate or extract Android project
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -67,10 +97,10 @@ jobs:
           mkdir -p "$EXTRACT_ROOT"
 
           is_project() {
-            local d="$1"
+            local dir="$1"
 
-            [[ -f "$d/settings.gradle.kts" || -f "$d/settings.gradle" ]] &&
-            [[ -f "$d/app/build.gradle.kts" || -f "$d/app/build.gradle" ]]
+            [[ -f "$dir/settings.gradle.kts" || -f "$dir/settings.gradle" ]] &&
+            [[ -f "$dir/app/build.gradle.kts" || -f "$dir/app/build.gradle" ]]
           }
 
           PROJECT=""
@@ -109,8 +139,12 @@ jobs:
                       os.path.join(destination, item.filename)
                   )
 
-                  if os.path.commonpath([destination, target]) != destination:
-                      raise SystemExit("Unsafe ZIP path: " + item.filename)
+                  if os.path.commonpath(
+                      [destination, target]
+                  ) != destination:
+                      raise SystemExit(
+                          "Unsafe ZIP path: " + item.filename
+                      )
 
               z.extractall(destination)
 
@@ -145,7 +179,7 @@ jobs:
           fi
 
           if [[ -z "$PROJECT" ]]; then
-            echo "::error::Android project not found."
+            echo "::error::No valid Android project found."
             exit 1
           fi
 
@@ -153,8 +187,18 @@ jobs:
 
           echo "Selected project: $PROJECT"
 
+          echo "===== ROOT FILES ====="
           ls -la "$PROJECT"
+
+          echo "===== APP FILES ====="
           ls -la "$PROJECT/app"
+
+          echo "===== GRADLE CONFIGURATION ====="
+
+          if [[ -f "$PROJECT/gradle/libs.versions.toml" ]]; then
+            grep -E 'agp =|kotlin =|googleServices =' \
+              "$PROJECT/gradle/libs.versions.toml" || true
+          fi
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
@@ -177,13 +221,18 @@ jobs:
           echo "===== ANDROID SDK ====="
           echo "$ANDROID_HOME"
 
-          echo "===== PROJECT CONFIGURATION ====="
+          echo "===== REQUIRED SDK ====="
+
+          test -d "$ANDROID_HOME/platforms/android-36-ext1"
+          test -d "$ANDROID_HOME/build-tools/36.0.0"
+          test -d "$ANDROID_HOME/platform-tools"
+
+          echo "===== PROJECT ====="
 
           test -f settings.gradle.kts -o -f settings.gradle
-
           test -f app/build.gradle.kts -o -f app/build.gradle
 
-          echo "Project verification completed."
+          echo "Environment verification completed."
 
       - name: Build Debug APK
         working-directory: ${{ env.PROJECT_DIR }}
@@ -191,7 +240,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          echo "Starting Gradle build..."
+          echo "===== START GRADLE BUILD ====="
 
           gradle \
             --no-daemon \
@@ -213,7 +262,7 @@ jobs:
 
           cp "$APK" "$GITHUB_WORKSPACE/output/Seedr-debug.apk"
 
-          echo "APK successfully generated."
+          echo "===== APK GENERATED ====="
 
           ls -lh "$GITHUB_WORKSPACE/output/Seedr-debug.apk"
 
