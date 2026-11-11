@@ -17,315 +17,138 @@ concurrency:
 
 jobs:
   build:
-    name: Build Seedr Debug APK
+    name: Build Android Debug APK
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    timeout-minutes: 60
 
     steps:
-      # ==========================================
-      # 1. CHECKOUT REPOSITORY
-      # ==========================================
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      # ==========================================
-      # 2. FIND AND EXTRACT ANDROID SOURCE
-      # ==========================================
-      - name: Locate and extract Seedr source
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          python3 <<'PY'
-          import os
-          import sys
-          import zipfile
-          from pathlib import Path, PurePosixPath
-
-          workspace = Path(os.environ["GITHUB_WORKSPACE"])
-          destination = workspace / "_seedr_android_source"
-
-          def is_project(directory):
-              return (
-                  (directory / "settings.gradle.kts").is_file()
-                  or (directory / "settings.gradle").is_file()
-              ) and (
-                  (directory / "app/build.gradle.kts").is_file()
-                  or (directory / "app/build.gradle").is_file()
-              )
-
-          project = None
-
-          if is_project(workspace):
-              project = workspace
-
-          if project is None:
-              archives = []
-
-              for path in workspace.rglob("*.zip"):
-                  if ".git" in path.parts:
-                      continue
-                  if path.name.lower().startswith("logs_"):
-                      continue
-                  archives.append(path)
-
-              candidates = []
-
-              for archive in archives:
-                  try:
-                      with zipfile.ZipFile(archive) as z:
-                          names = set(z.namelist())
-
-                          for name in names:
-                              p = PurePosixPath(name)
-
-                              if p.name not in (
-                                  "settings.gradle.kts",
-                                  "settings.gradle"
-                              ):
-                                  continue
-
-                              prefix = str(p.parent)
-                              if prefix == ".":
-                                  prefix = ""
-
-                              gradle_files = [
-                                  f"{prefix}/app/build.gradle.kts",
-                                  f"{prefix}/app/build.gradle"
-                              ]
-
-                              if any(f in names for f in gradle_files):
-                                  candidates.append((archive, prefix))
-                  except Exception as error:
-                      print(f"Skipping {archive}: {error}")
-
-              if len(candidates) == 0:
-                  print("ERROR: No Android project or source ZIP found.")
-                  print("Repository contents:")
-                  for item in workspace.iterdir():
-                      print(item.name)
-                  sys.exit(1)
-
-              if len(candidates) > 1:
-                  print("ERROR: Multiple Android source archives found:")
-                  for archive, prefix in candidates:
-                      print(archive, prefix)
-                  sys.exit(1)
-
-              archive, prefix = candidates[0]
-
-              if destination.exists():
-                  import shutil
-                  shutil.rmtree(destination)
-
-              destination.mkdir(parents=True)
-
-              with zipfile.ZipFile(archive) as z:
-                  for item in z.infolist():
-                      target = (destination / item.filename).resolve()
-
-                      if not target.is_relative_to(destination.resolve()):
-                          raise RuntimeError(
-                              f"Unsafe ZIP entry: {item.filename}"
-                          )
-
-                  z.extractall(destination)
-
-              project = destination / prefix if prefix else destination
-
-          if not is_project(project):
-              print("ERROR: Extracted project structure is invalid.")
-              sys.exit(1)
-
-          project = project.resolve()
-
-          with open(os.environ["GITHUB_ENV"], "a") as env:
-              env.write(f"PROJECT_DIR={project}\n")
-
-          print("===================================")
-          print("ANDROID PROJECT FOUND")
-          print(project)
-          print("===================================")
-
-          for item in project.iterdir():
-              print(item.name)
-          PY
-
-      # ==========================================
-      # 3. VERIFY SOURCE BEFORE JAVA SETUP
-      # ==========================================
-      - name: Verify Android source
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          REQUIRED_FILES=(
-            "settings.gradle.kts"
-            "build.gradle.kts"
-            "gradle/libs.versions.toml"
-            "gradle/wrapper/gradle-wrapper.properties"
-            "app/build.gradle.kts"
-            "app/src/main/AndroidManifest.xml"
-          )
-
-          for FILE in "${REQUIRED_FILES[@]}"; do
-            if [[ ! -f "$FILE" ]]; then
-              echo "::error::Missing source file: $FILE"
-              exit 1
-            fi
-
-            echo "OK: $FILE"
-          done
-
-          echo "Kotlin source count:"
-          find app/src/main -type f -name '*.kt' | wc -l
-
-      # ==========================================
-      # 4. JAVA 17
-      # IMPORTANT: NO GRADLE CACHE HERE
-      # ==========================================
       - name: Set up Java 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      # ==========================================
-      # 5. ANDROID SDK MANAGER
-      # ==========================================
-      - name: Locate Android SDK Manager
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
+          packages: |
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
+
+      - name: Locate Android project
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          if [[ ! -d "$ANDROID_HOME" ]]; then
-            echo "::error::Android SDK not found."
+          ROOT="$GITHUB_WORKSPACE"
+          EXTRACT_ROOT="$RUNNER_TEMP/seedr-extracted"
+          mkdir -p "$EXTRACT_ROOT"
+
+          is_project() {
+            local d="$1"
+            [[ -f "$d/settings.gradle.kts" || -f "$d/settings.gradle" ]] &&
+            [[ -f "$d/app/build.gradle.kts" || -f "$d/app/build.gradle" ]]
+          }
+
+          PROJECT=""
+
+          if is_project "$ROOT"; then
+            PROJECT="$ROOT"
+          else
+            shopt -s nullglob
+            ZIPS=("$ROOT"/*.zip)
+            shopt -u nullglob
+
+            if (( ${#ZIPS[@]} == 0 )); then
+              echo "::error::No Android project or ZIP found."
+              exit 1
+            fi
+
+            INDEX=0
+
+            for ZIP in "${ZIPS[@]}"; do
+              INDEX=$((INDEX + 1))
+              DEST="$EXTRACT_ROOT/archive-$INDEX"
+              mkdir -p "$DEST"
+
+              python3 - "$ZIP" "$DEST" <<'PY'
+          import os, sys, zipfile
+
+          archive, dest = sys.argv[1], os.path.abspath(sys.argv[2])
+
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  target = os.path.abspath(os.path.join(dest, item.filename))
+                  if os.path.commonpath([dest, target]) != dest:
+                      raise SystemExit("Unsafe ZIP path: " + item.filename)
+              z.extractall(dest)
+
+          print("Extracted:", archive)
+          PY
+
+              while IFS= read -r -d '' SETTINGS; do
+                CANDIDATE="$(dirname "$SETTINGS")"
+
+                if is_project "$CANDIDATE"; then
+                  if [[ -n "$PROJECT" ]]; then
+                    echo "::error::Multiple Android projects found."
+                    exit 1
+                  fi
+                  PROJECT="$CANDIDATE"
+                fi
+              done < <(
+                find "$DEST" \
+                  -type d \( -name .git -o -name build -o -name .gradle -o -name node_modules \) -prune \
+                  -o \( -name settings.gradle.kts -o -name settings.gradle \) -type f -print0
+              )
+            done
+          fi
+
+          if [[ -z "$PROJECT" ]]; then
+            echo "::error::Android project not found."
             exit 1
           fi
 
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager 2>/dev/null \
-            | sort -V | tail -n 1)"
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
 
-          if [[ -z "$SDKMANAGER" ]]; then
-            echo "::error::SDK Manager not found."
-            exit 1
-          fi
+          echo "Selected project: $PROJECT"
+          ls -la "$PROJECT"
+          ls -la "$PROJECT/app"
 
-          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-
-          echo "Using: $SDKMANAGER"
-
-      # ==========================================
-      # 6. SDK LICENSES
-      # ==========================================
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          set +o pipefail
-          yes | "$SDKMANAGER" --licenses >/dev/null
-          set -o pipefail
-
-          echo "SDK licenses accepted."
-
-      # ==========================================
-      # 7. INSTALL SDK COMPONENTS
-      # ==========================================
-      - name: Install Android SDK components
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          PACKAGES=()
-
-          [[ -d "$ANDROID_HOME/platforms/android-36" ]] || \
-            PACKAGES+=("platforms;android-36")
-
-          [[ -d "$ANDROID_HOME/build-tools/36.0.0" ]] || \
-            PACKAGES+=("build-tools;36.0.0")
-
-          [[ -d "$ANDROID_HOME/platform-tools" ]] || \
-            PACKAGES+=("platform-tools")
-
-          if (( ${#PACKAGES[@]} > 0 )); then
-            "$SDKMANAGER" --install "${PACKAGES[@]}"
-          fi
-
-          test -d "$ANDROID_HOME/platforms/android-36"
-          test -d "$ANDROID_HOME/build-tools/36.0.0"
-          test -d "$ANDROID_HOME/platform-tools"
-
-          echo "SDK installation verified."
-
-      # ==========================================
-      # 8. PREPARE DEBUG KEYSTORE
-      # ==========================================
-      - name: Prepare debug keystore
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          if [[ ! -f debug.keystore ]]; then
-            keytool -genkeypair \
-              -noprompt \
-              -keystore debug.keystore \
-              -storepass android \
-              -alias androiddebugkey \
-              -keypass android \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
-
-          keytool -list \
-            -keystore debug.keystore \
-            -storepass android
-
-          echo "Debug keystore ready."
-
-      # ==========================================
-      # 9. SET UP GRADLE AFTER SOURCE EXTRACTION
-      # ==========================================
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
           cache-read-only: false
 
-      # ==========================================
-      # 10. VERIFY BUILD ENVIRONMENT
-      # ==========================================
-      - name: Verify build environment
+      - name: Verify environment
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
+          echo "===== JAVA ====="
           java -version
+
+          echo "===== GRADLE ====="
           gradle --version
 
-          echo "Gradle configuration:"
-          cat gradle/wrapper/gradle-wrapper.properties
+          echo "===== ANDROID SDK ====="
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          sdkmanager --list_installed
 
-          echo "SDK platforms:"
-          ls "$ANDROID_HOME/platforms"
+          echo "===== PROJECT ====="
+          test -f settings.gradle.kts -o -f settings.gradle
+          test -f app/build.gradle.kts -o -f app/build.gradle
 
-          echo "Build tools:"
-          ls "$ANDROID_HOME/build-tools"
+          echo "Project verification completed."
 
-      # ==========================================
-      # 11. BUILD APK
-      # ==========================================
-      - name: Build Seedr Debug APK
+      - name: Build Debug APK
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
@@ -335,14 +158,12 @@ jobs:
             --no-daemon \
             --stacktrace \
             --warning-mode all \
-            --no-configuration-cache \
             :app:assembleDebug
 
           APK="app/build/outputs/apk/debug/app-debug.apk"
 
-          if [[ ! -s "$APK" ]]; then
-            echo "::error::APK was not generated."
-
+          if [[ ! -f "$APK" ]]; then
+            echo "::error::APK file not found."
             find app/build/outputs -type f -print || true
             exit 1
           fi
@@ -354,48 +175,11 @@ jobs:
           echo "APK successfully generated."
           ls -lh "$GITHUB_WORKSPACE/output/Seedr-debug.apk"
 
-      # ==========================================
-      # 12. VERIFY APK
-      # ==========================================
-      - name: Verify APK
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          APK="$GITHUB_WORKSPACE/output/Seedr-debug.apk"
-
-          test -s "$APK"
-
-          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
-
-          if [[ -x "$AAPT" ]]; then
-            "$AAPT" dump badging "$APK" | head -n 5
-          fi
-
-          sha256sum "$APK"
-
-      # ==========================================
-      # 13. UPLOAD APK
-      # ==========================================
-      - name: Upload Seedr APK
+      - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Seedr-Android-APK
+          name: Seedr-Android-Debug-APK
           path: output/Seedr-debug.apk
           if-no-files-found: error
-          retention-days: 30
-
-      # ==========================================
-      # 14. UPLOAD DIAGNOSTICS
-      # ==========================================
-      - name: Upload build diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Seedr-Build-Diagnostics
-          path: |
-            **/build/reports/**
-            **/build/outputs/logs/**
-          if-no-files-found: ignore
           retention-days: 14
