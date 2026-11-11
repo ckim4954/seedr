@@ -35,10 +35,26 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           accept-android-sdk-licenses: true
-          packages: |
-            platform-tools
-            platforms;android-36
-            build-tools;36.0.0
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Checking Android SDK..."
+          echo "ANDROID_HOME=$ANDROID_HOME"
+
+          command -v sdkmanager
+
+          echo "Installing Android SDK components..."
+
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+          echo "Installed SDK packages:"
+          sdkmanager --list_installed
 
       - name: Locate Android project
         shell: bash
@@ -47,10 +63,12 @@ jobs:
 
           ROOT="$GITHUB_WORKSPACE"
           EXTRACT_ROOT="$RUNNER_TEMP/seedr-extracted"
+
           mkdir -p "$EXTRACT_ROOT"
 
           is_project() {
             local d="$1"
+
             [[ -f "$d/settings.gradle.kts" || -f "$d/settings.gradle" ]] &&
             [[ -f "$d/app/build.gradle.kts" || -f "$d/app/build.gradle" ]]
           }
@@ -74,19 +92,27 @@ jobs:
             for ZIP in "${ZIPS[@]}"; do
               INDEX=$((INDEX + 1))
               DEST="$EXTRACT_ROOT/archive-$INDEX"
+
               mkdir -p "$DEST"
 
               python3 - "$ZIP" "$DEST" <<'PY'
-          import os, sys, zipfile
+          import os
+          import sys
+          import zipfile
 
-          archive, dest = sys.argv[1], os.path.abspath(sys.argv[2])
+          archive = sys.argv[1]
+          destination = os.path.abspath(sys.argv[2])
 
           with zipfile.ZipFile(archive) as z:
               for item in z.infolist():
-                  target = os.path.abspath(os.path.join(dest, item.filename))
-                  if os.path.commonpath([dest, target]) != dest:
+                  target = os.path.abspath(
+                      os.path.join(destination, item.filename)
+                  )
+
+                  if os.path.commonpath([destination, target]) != destination:
                       raise SystemExit("Unsafe ZIP path: " + item.filename)
-              z.extractall(dest)
+
+              z.extractall(destination)
 
           print("Extracted:", archive)
           PY
@@ -99,12 +125,21 @@ jobs:
                     echo "::error::Multiple Android projects found."
                     exit 1
                   fi
+
                   PROJECT="$CANDIDATE"
                 fi
               done < <(
                 find "$DEST" \
-                  -type d \( -name .git -o -name build -o -name .gradle -o -name node_modules \) -prune \
-                  -o \( -name settings.gradle.kts -o -name settings.gradle \) -type f -print0
+                  -type d \( \
+                    -name .git -o \
+                    -name build -o \
+                    -name .gradle -o \
+                    -name node_modules \
+                  \) -prune \
+                  -o \( \
+                    -name settings.gradle.kts -o \
+                    -name settings.gradle \
+                  \) -type f -print0
               )
             done
           fi
@@ -117,6 +152,7 @@ jobs:
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
 
           echo "Selected project: $PROJECT"
+
           ls -la "$PROJECT"
           ls -la "$PROJECT/app"
 
@@ -126,7 +162,7 @@ jobs:
           gradle-version: '9.3.1'
           cache-read-only: false
 
-      - name: Verify environment
+      - name: Verify build environment
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
@@ -139,11 +175,12 @@ jobs:
           gradle --version
 
           echo "===== ANDROID SDK ====="
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          sdkmanager --list_installed
+          echo "$ANDROID_HOME"
 
-          echo "===== PROJECT ====="
+          echo "===== PROJECT CONFIGURATION ====="
+
           test -f settings.gradle.kts -o -f settings.gradle
+
           test -f app/build.gradle.kts -o -f app/build.gradle
 
           echo "Project verification completed."
@@ -153,6 +190,8 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          echo "Starting Gradle build..."
 
           gradle \
             --no-daemon \
@@ -164,7 +203,9 @@ jobs:
 
           if [[ ! -f "$APK" ]]; then
             echo "::error::APK file not found."
+
             find app/build/outputs -type f -print || true
+
             exit 1
           fi
 
@@ -173,9 +214,10 @@ jobs:
           cp "$APK" "$GITHUB_WORKSPACE/output/Seedr-debug.apk"
 
           echo "APK successfully generated."
+
           ls -lh "$GITHUB_WORKSPACE/output/Seedr-debug.apk"
 
-      - name: Upload APK
+      - name: Upload APK Artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
